@@ -1,0 +1,357 @@
+# ------------------------------------------------------------------------------
+# AWS CloudFormation Deployment Workflow
+# ------------------------------------------------------------------------------
+#
+# Deploys AWS resources using CloudFormation templates with comprehensive
+# parameter support, change set management, and deployment monitoring.
+#
+# ----------------------------------------------------------------------------
+# INPUTS:
+# ----------------------------------------------------------------------------
+#
+# template-file - Path to the CloudFormation template file (REQUIRED)
+# stack-name - Name of the CloudFormation stack (REQUIRED)
+# region - AWS region for deployment (REQUIRED)
+# account-id - AWS account ID to deploy to (REQUIRED)
+# role-name - AWS IAM role name to assume for deployment (REQUIRED)
+# parameters-file - Path to parameters file for the template (OPTIONAL)
+# parameters-overrides - Parameter key-value pairs as comma-separated list (OPTIONAL)
+#                        Format: "Key1=Value1,Key2=Value2"
+#                        Overrides values from parameters-file if both provided
+# capabilities - List of CloudFormation capabilities (OPTIONAL, default: "CAPABILITY_IAM,CAPABILITY_NAMED_IAM")
+# timeout-in-minutes - Timeout for stack creation/update (OPTIONAL, default: 30)
+# fail-on-empty-changeset - Fail when no changes detected (OPTIONAL, default: false)
+# notifications-arn - SNS topic ARN for deployment notifications (OPTIONAL)
+#
+# ----------------------------------------------------------------------------
+# OUTPUTS:
+# ----------------------------------------------------------------------------
+#
+# stack-id - ARN of the deployed CloudFormation stack
+# outputs - JSON object containing all stack outputs
+# stack-status - Final status of the CloudFormation stack
+#
+# ----------------------------------------------------------------------------
+# USAGE:
+# ----------------------------------------------------------------------------
+#
+# name: Deploy Infrastructure
+#
+# on:
+#   push:
+#     branches: [main]
+#     paths:
+#       - 'cloudformation/**'
+#
+# jobs:
+#   deploy:
+#     name: Deploy CloudFormation Stack
+#     uses: cfg-it/gha-reusable-workflows/.github/workflows/aws-cfn-deploy.yml@v1
+#     with:
+#       template-file: cloudformation/infrastructure.yml
+#       stack-name: my-application-stack
+#       region: us-west-2
+#       account-id: ${{ secrets.AWS_ACCOUNT_ID }}
+#       role-name: cfn-deployer-role
+#       # Option 1: Using parameters file
+#       parameters-file: cloudformation/parameters/prod.json
+#       # Option 2: Using inline parameters (as comma-separated list)
+#       # parameters-overrides: "BucketName=my-app-bucket,Environment=prod"
+#       # Option 3: Using both (overrides take precedence over file values)
+#       capabilities: "CAPABILITY_IAM,CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND"
+#       timeout-in-minutes: 45
+#       fail-on-empty-changeset: false
+#     permissions:
+#       contents: read
+#       id-token: write
+#
+# ----------------------------------------------------------------------------
+# Template
+# ----------------------------------------------------------------------------
+#
+# name: CD
+#
+# on:
+#   workflow_dispatch:
+#   push:
+#     branches:
+#       - main
+#     paths:
+#       - 'main.yaml'
+#       - 'cloudformation/*'
+#
+# jobs:
+#   dev:
+#     name: DEV
+#     uses: cfg-it/gha-reusable-workflows/.github/workflows/aws-cfn-deploy.yml@v3
+#     with:
+#         environment: dev
+#         account-id: ${{ vars.AWS_CFN_ACCOUNT_ID }}
+#         region: ${{ vars.AWS_REGION }}
+#         role-name: ${{ vars.AWS_CFN_DEPLOY_ROLE_NAME }}
+#         template-file: main.yaml
+#         stack-name: ${{ vars.STACK_NAME }}
+#         # Using parameters file
+#         parameters-file: parameters/dev-parameters.yaml
+#         # Adding dynamic parameters that override file values
+#         parameters-overrides: "Version=${{ github.sha }},DeployTime=${{ github.event.repository.updated_at }}"
+#         tags-file: tags.json
+#         timeout-minutes: 30
+#     secrets: inherit
+#
+# ------------------------------------------------------------------------------
+
+name: AWS CFN Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: The environment to run cloudformation against (dev, qa, prd). This should match the GitHub environment.
+        required: true
+        type: string
+      account-id:
+        description: The AWS account ID.
+        required: true
+        type: string
+      region:
+        description: "The AWS region where resources are located"
+        required: true
+        type: string
+      role-name:
+        description: "The name of the AWS IAM role to assume"
+        required: true
+        type: string
+			stack-name:
+				description: Name of the CloudFormation stack to deploy.
+				required: true
+				type: string
+			template-file:
+				description: Path to the local CloudFormation template file to deploy (main.yaml).
+				required: true
+				type: string
+			parameters-file:
+				description: >-
+					Path to parameters file with parameter overrides for the CloudFormation stack.
+					Can be used alone or in combination with parameters-overrides.
+				required: false
+				type: string
+				default: ""
+			parameters-overrides:
+				description: >-
+					Parameter key-value pairs as comma-separated list.
+					Values here will override any duplicate keys from parameters-file.
+					Format: "Key1=Value1,Key2=Value2,Key3=Value3"
+				required: false
+				type: string
+				default: ""
+      tags-file:
+        description: Path to tags file to apply to the CloudFormation stack.
+        required: true
+        type: string
+        default: ./tags.json
+      capabilities:
+        description: The comma-delimited list of stack template capabilities to acknowledge. Defaults to 'CAPABILITY_IIAM'
+        required: false
+        type: string
+        default: "CAPABILITY_IAM"
+      no-fail-on-empty-changeset:
+        description: Whether to fail the workflow if no changes are detected in the CloudFormation stack.
+        required: false
+        type: string
+        default: "1"
+      timeout-minutes:
+        description: The maximum time in minutes the workflow is allowed to run.
+        required: false
+        type: number
+        default: 30
+
+
+
+concurrency:
+  # Don't deploy the same stack in the same account/region at the same time
+  group: ${{ inputs.account-id }}-${{ inputs.region }}-${{ inputs.stack-name }}
+  cancel-in-progress: false
+
+jobs:
+  aws-cfn-deploy:
+    name: AWS CFN Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+
+      - name: 🏷️ Read Tags File
+        id: read-tags
+        run: |
+          if [ -f "${{ inputs.tags-file }}" ]; then
+            # Read file content and remove whitespace/newlines
+            TAGS_CONTENT=$(cat "${{ inputs.tags-file }}" | tr -d '\n\r' | sed 's/ //g')
+            echo "tags_content=$TAGS_CONTENT" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Tags file not found at: ${{ inputs.tags-file }}"
+            echo "tags_content=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 📝 Process Parameters File
+        id: process-parameters
+        run: |
+          echo "::group::Parameters Processing"
+
+          PARAMS_FILE="${{ github.workspace }}/combined-parameters.json"
+
+          # Initialize with empty parameter set
+          echo "[]" > "$PARAMS_FILE"
+
+          # Load parameters-file if provided (with validation)
+          if [ -n "${{ inputs.parameters-file }}" ] && [ -f "${{ inputs.parameters-file }}" ]; then
+            echo "Loading parameters from file: ${{ inputs.parameters-file }}"
+
+            # Validate JSON before using it
+            if jq empty "${{ inputs.parameters-file }}" 2>/dev/null; then
+              # Check if file contains an array or object
+              if [[ $(jq 'if type=="array" then true else false end' "${{ inputs.parameters-file }}") == "true" ]]; then
+                # File is already an array format
+                cp "${{ inputs.parameters-file }}" "$PARAMS_FILE"
+              else
+                # File is object format, convert to array format
+                jq -r 'to_entries | map({"ParameterKey": .key, "ParameterValue": .value | tostring})' \
+                  "${{ inputs.parameters-file }}" > "$PARAMS_FILE"
+              fi
+              echo "Parameters file loaded successfully."
+            else
+              echo "::warning::Parameters file contains invalid JSON. Using empty parameter set."
+            fi
+          else
+            echo "No parameters file provided or file not found."
+          fi
+
+          # Process parameters-overrides if provided
+          if [ -n "${{ inputs.parameters-overrides }}" ]; then
+            echo "Applying parameter overrides: ${{ inputs.parameters-overrides }}"
+
+            # Create temporary file for override processing
+            TEMP_FILE="${{ github.workspace }}/params-temp.json"
+
+            # Convert comma-separated list to array of ParameterKey/ParameterValue objects
+            # Handle both single parameter case and multiple parameter case
+            echo "${{ inputs.parameters-overrides }}" | grep -q "," && is_multiple=true || is_multiple=false
+
+            if [ "$is_multiple" = true ]; then
+              # Multiple parameters
+              echo "[" > "$TEMP_FILE"
+              first=true
+              echo "${{ inputs.parameters-overrides }}" | tr ',' '\n' | while read param; do
+                key=$(echo "$param" | cut -d= -f1)
+                value=$(echo "$param" | cut -d= -f2-)
+
+                if [ "$first" = true ]; then
+                  first=false
+                else
+                  echo "," >> "$TEMP_FILE"
+                fi
+
+                echo "  {\"ParameterKey\":\"$key\",\"ParameterValue\":\"$value\"}" >> "$TEMP_FILE"
+              done
+              echo "]" >> "$TEMP_FILE"
+            else
+              # Single parameter
+              param="${{ inputs.parameters-overrides }}"
+              key=$(echo "$param" | cut -d= -f1)
+              value=$(echo "$param" | cut -d= -f2-)
+              echo "[{\"ParameterKey\":\"$key\",\"ParameterValue\":\"$value\"}]" > "$TEMP_FILE"
+            fi
+
+            # Validate generated JSON
+            if jq empty "$TEMP_FILE" 2>/dev/null; then
+              echo "Override parameters converted successfully."
+
+              # Merge parameters with overrides
+              jq -s '
+                # Combine both arrays
+                add |
+                # Group by parameter key
+                group_by(.ParameterKey) |
+                # For each group, take the last occurrence (i.e., the override)
+                map(last)
+              ' "$PARAMS_FILE" "$TEMP_FILE" > "${PARAMS_FILE}.tmp"
+
+              if [ $? -eq 0 ]; then
+                mv "${PARAMS_FILE}.tmp" "$PARAMS_FILE"
+                echo "Parameters merged successfully."
+              else
+                echo "::warning::Failed to merge parameters. Using only file parameters."
+              fi
+            else
+              echo "::warning::Failed to convert overrides to valid JSON. Using only file parameters."
+            fi
+          else
+            echo "No parameter overrides provided."
+          fi
+
+          # Check if parameters file is empty or invalid
+          if [ ! -s "$PARAMS_FILE" ] || ! jq empty "$PARAMS_FILE" 2>/dev/null || [ "$(jq 'length' "$PARAMS_FILE")" -eq 0 ]; then
+            echo "No valid parameters to pass to CloudFormation."
+            echo "parameters_path=" >> $GITHUB_OUTPUT
+          else
+            echo "Final merged parameters:"
+            jq '.' "$PARAMS_FILE"
+            echo "parameters_path=file:///$PARAMS_FILE" >> $GITHUB_OUTPUT
+          fi
+
+          echo "::endgroup::"
+
+      - name: 🔐 Configure AWS Credentials
+        uses: cfg-it/gha-configure-aws-credentials@2794c9476504aedcd5fff03c086fe5217e30df34
+        with:
+          aws-region: ${{ inputs.region }}
+          aws-account-id: ${{ inputs.account-id }}
+          aws-role-name: ${{ inputs.role-name }}
+          role-duration-minutes: ${{ inputs.timeout-minutes }}
+
+      - name: 🚀 Deploy CloudFormation Stack
+        id: deploy-cfn
+        uses: aws-actions/aws-cloudformation-github-deploy@33527b83bddcf6b3f0b135d9550bde8475325c73
+        with:
+          name: ${{ inputs.stack-name }}
+          template: ${{ inputs.template-file }}
+          parameter-overrides: ${{ steps.process-parameters.outputs.parameters_path }}
+          no-fail-on-empty-changeset: ${{ inputs.no-fail-on-empty-changeset }}
+          tags: ${{ steps.read-tags.outputs.tags_content }}
+          capabilities: ${{ inputs.capabilities }}
+          disable-rollback: "1"
+
+      - name: 📋 Create GitHub Summary
+        run: |
+          echo "## 🚀 AWS CloudFormation Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.deploy-cfn.outcome }}" == "success" ]; then
+            echo "### ✅ DEPLOYMENT SUCCEEDED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ DEPLOYMENT FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "* **Stack Name:** \`${{ inputs.stack-name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "* **Environment:** \`${{ inputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "* **AWS Region:** \`${{ inputs.region }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "* **AWS Account:** \`${{ inputs.account-id }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "* **Template:** \`${{ inputs.template-file }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ inputs.parameters-file }}" ]; then
+            echo "* **Parameters File:** \`${{ inputs.parameters-file }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -n "${{ inputs.parameters-overrides }}" ]; then
+            echo "* **Parameters Overrides:** \`Applied\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "* **Deployment Time:** \`$(date -u +"%Y-%m-%d %H:%M:%S UTC")\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
