@@ -139,7 +139,7 @@ jobs:
         with:
           aws-region: ${{ inputs.region }}
           role-to-assume: arn:aws:iam::${{ inputs.account-id }}:role/${{ inputs.role-name }}
-          role-duration-seconds: ${{ inputs.timeout-minutes * 60 }}
+          role-duration-seconds: 3600
 
       - name: 🚀 Deploy CloudFormation Stack
         id: deploy-cfn
