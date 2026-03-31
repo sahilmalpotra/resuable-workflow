@@ -87,10 +87,11 @@ jobs:
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
+
       - name: 🔍 Check Repo Name (Debug)
         run: |
           echo "The repo is: ${{ github.repository }}"
-          echo "The context is: ${{ github.event_name }}"  
+          echo "The context is: ${{ github.event_name }}"
 
       - name: 🏷️ Read Tags File
         id: read-tags
@@ -107,35 +108,108 @@ jobs:
         id: process-parameters
         run: |
           echo "::group::Parameters Processing"
+
           PARAMS_FILE="${{ github.workspace }}/combined-parameters.json"
+
+          # Initialize with empty parameter set
           echo "[]" > "$PARAMS_FILE"
 
+          # Load parameters-file if provided (with validation)
           if [ -n "${{ inputs.parameters-file }}" ] && [ -f "${{ inputs.parameters-file }}" ]; then
+            echo "Loading parameters from file: ${{ inputs.parameters-file }}"
+
+            # Validate JSON before using it
             if jq empty "${{ inputs.parameters-file }}" 2>/dev/null; then
+              # Check if file contains an array or object
               if [[ $(jq 'if type=="array" then true else false end' "${{ inputs.parameters-file }}") == "true" ]]; then
+                # File is already an array format
                 cp "${{ inputs.parameters-file }}" "$PARAMS_FILE"
               else
+                # File is object format, convert to array format
                 jq -r 'to_entries | map({"ParameterKey": .key, "ParameterValue": .value | tostring})' \
                   "${{ inputs.parameters-file }}" > "$PARAMS_FILE"
               fi
+              echo "Parameters file loaded successfully."
             else
-              echo "::warning::Invalid JSON in parameters file."
+              echo "::warning::Parameters file contains invalid JSON. Using empty parameter set."
             fi
-          fi
-
-          if [ -n "${{ inputs.parameters-overrides }}" ]; then
-            TEMP_FILE="${{ github.workspace }}/params-temp.json"
-            # Convert overrides logic...
-            echo "${{ inputs.parameters-overrides }}" | tr ',' '\n' | jq -R 'split("=") | {ParameterKey: .[0], ParameterValue: .[1]}' | jq -s '.' > "$TEMP_FILE"
-            
-            jq -s 'add | group_by(.ParameterKey) | map(last)' "$PARAMS_FILE" "$TEMP_FILE" > "${PARAMS_FILE}.tmp" && mv "${PARAMS_FILE}.tmp" "$PARAMS_FILE"
-          fi
-
-          if [ -s "$PARAMS_FILE" ] && [ "$(jq 'length' "$PARAMS_FILE")" -gt 0 ]; then
-            echo "parameters_path=file:///$PARAMS_FILE" >> $GITHUB_OUTPUT
           else
-            echo "parameters_path=" >> $GITHUB_OUTPUT
+            echo "No parameters file provided or file not found."
           fi
+
+          # Process parameters-overrides if provided
+          if [ -n "${{ inputs.parameters-overrides }}" ]; then
+            echo "Applying parameter overrides: ${{ inputs.parameters-overrides }}"
+
+            # Create temporary file for override processing
+            TEMP_FILE="${{ github.workspace }}/params-temp.json"
+
+            # Convert comma-separated list to array of ParameterKey/ParameterValue objects
+            # Handle both single parameter case and multiple parameter case
+            echo "${{ inputs.parameters-overrides }}" | grep -q "," && is_multiple=true || is_multiple=false
+
+            if [ "$is_multiple" = true ]; then
+              # Multiple parameters
+              echo "[" > "$TEMP_FILE"
+              first=true
+              echo "${{ inputs.parameters-overrides }}" | tr ',' '\n' | while read param; do
+                key=$(echo "$param" | cut -d= -f1)
+                value=$(echo "$param" | cut -d= -f2-)
+
+                if [ "$first" = true ]; then
+                  first=false
+                else
+                  echo "," >> "$TEMP_FILE"
+                fi
+
+                echo "  {\"ParameterKey\":\"$key\",\"ParameterValue\":\"$value\"}" >> "$TEMP_FILE"
+              done
+              echo "]" >> "$TEMP_FILE"
+            else
+              # Single parameter
+              param="${{ inputs.parameters-overrides }}"
+              key=$(echo "$param" | cut -d= -f1)
+              value=$(echo "$param" | cut -d= -f2-)
+              echo "[{\"ParameterKey\":\"$key\",\"ParameterValue\":\"$value\"}]" > "$TEMP_FILE"
+            fi
+
+            # Validate generated JSON
+            if jq empty "$TEMP_FILE" 2>/dev/null; then
+              echo "Override parameters converted successfully."
+
+              # Merge parameters with overrides
+              jq -s '
+                # Combine both arrays
+                add |
+                # Group by parameter key
+                group_by(.ParameterKey) |
+                # For each group, take the last occurrence (i.e., the override)
+                map(last)
+              ' "$PARAMS_FILE" "$TEMP_FILE" > "${PARAMS_FILE}.tmp"
+
+              if [ $? -eq 0 ]; then
+                mv "${PARAMS_FILE}.tmp" "$PARAMS_FILE"
+                echo "Parameters merged successfully."
+              else
+                echo "::warning::Failed to merge parameters. Using only file parameters."
+              fi
+            else
+              echo "::warning::Failed to convert overrides to valid JSON. Using only file parameters."
+            fi
+          else
+            echo "No parameter overrides provided."
+          fi
+
+          # Check if parameters file is empty or invalid
+          if [ ! -s "$PARAMS_FILE" ] || ! jq empty "$PARAMS_FILE" 2>/dev/null || [ "$(jq 'length' "$PARAMS_FILE")" -eq 0 ]; then
+            echo "No valid parameters to pass to CloudFormation."
+            echo "parameters_path=" >> $GITHUB_OUTPUT
+          else
+            echo "Final merged parameters:"
+            jq '.' "$PARAMS_FILE"
+            echo "parameters_path=file:///$PARAMS_FILE" >> $GITHUB_OUTPUT
+          fi
+
           echo "::endgroup::"
 
       - name: 🔐 Configure AWS Credentials
